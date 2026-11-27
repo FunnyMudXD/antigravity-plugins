@@ -48,8 +48,14 @@
       <!-- Compact Session Summary Card -->
       <section class="card summary-card">
         <div class="card-head">
-          <span class="card-label">本会话总览</span>
-          <span id="ctx-badge" class="ctx-badge" title="最近一步输入上下文总大小">上下文 --</span>
+          <span class="card-label" id="sum-card-label">本会话总览</span>
+          <div class="card-head-right">
+            <div id="scope-toggle" class="scope-toggle hidden" role="tablist" aria-label="统计范围">
+              <button type="button" class="scope-btn active" data-scope="combined">总计</button>
+              <button type="button" class="scope-btn" data-scope="main">主对话</button>
+            </div>
+            <span id="ctx-badge" class="ctx-badge" title="主对话最近一步输入上下文总大小">上下文 --</span>
+          </div>
         </div>
 
         <div class="hit-bar-wrap">
@@ -76,12 +82,22 @@
             <span id="sum-out" class="kv-v mono">--</span>
           </div>
           <div class="kv-cell">
-            <span class="kv-k">模型 / 工具耗时</span>
+            <span class="kv-k" id="sum-time-label">模型 / 工具耗时</span>
             <span id="sum-time" class="kv-v mono">--</span>
           </div>
         </div>
 
+        <div id="sub-split-bar" class="sub-split-bar hidden"></div>
         <div id="miss-banner" class="miss-banner hidden"></div>
+      </section>
+
+      <!-- Subagents list (only visible when subagents exist) -->
+      <section id="subagents-section" class="subagents-section hidden">
+        <div class="section-head">
+          <span class="card-label">子智能体用量（点击查看详情）</span>
+          <span id="subagents-count" class="muted mono">0 个</span>
+        </div>
+        <div id="subagents-list" class="subagents-list"></div>
       </section>
 
       <!-- Per-turn list -->
@@ -100,6 +116,7 @@
     <div class="modal-card" id="modal-card">
       <div class="modal-head">
         <div class="modal-title-row">
+          <button id="modal-back" class="modal-back hidden" type="button" aria-label="返回上一级" title="返回上一级">←</button>
           <span id="modal-icon" class="modal-icon"></span>
           <span id="modal-title" class="modal-title">本轮用量</span>
         </div>

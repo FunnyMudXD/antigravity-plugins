@@ -3,6 +3,8 @@
 
 Silent on intermediate tool-calling steps; injects 1 concise summary at the end
 of each turn (when the latest PLANNER_RESPONSE has no tool_calls).
+Automatically discovers and recursively aggregates subagent (invoke_subagent /
+swarm) transcripts spawned by the current conversation.
 
 CLI usage:
     python scripts/token_stats.py --file <path/to/transcript.jsonl>
@@ -22,6 +24,12 @@ from typing import Any
 INVISIBLE_MARKER = "\u2063"
 CREATED_RE = re.compile(r"Created At:\s*([0-9T:\-\.\+Z]+)")
 COMPLETED_RE = re.compile(r"Completed At:\s*([0-9T:\-\.\+Z]+)")
+ID_RE = re.compile(r"^[0-9a-f-]{8,}$", re.IGNORECASE)
+SUBAGENT_CREATED_RE = re.compile(r"Created the following subagent:\s*(\{[\s\S]*?\n\})")
+CONV_ID_FIELD_RE = re.compile(r'"conversation(?:Id|_id)"\s*:\s*"([0-9a-f-]{8,})"', re.IGNORECASE)
+
+MAX_SUBAGENT_DEPTH = 6
+MAX_SUBAGENT_COUNT = 64
 
 
 def fmt_num(n: int | float) -> str:
@@ -56,13 +64,33 @@ def fmt_duration(ms: float) -> str:
 def fmt_model(raw: str | None) -> str:
     if not raw:
         return "Unknown"
-    parts = raw.strip().split("-")
-    # e.g. gemini-4-neon-high -> Gemini 4 Neon (High)
-    tier_words = {"high", "medium", "low", "fast", "thinking"}
+    cleaned = raw.strip()
+    if not cleaned:
+        return "Unknown"
+    if " " in cleaned:
+        return cleaned
+    parts = cleaned.split("-")
+    # 例如 gemini-4-neon-high -> Gemini 4 Neon (High)
+    tier_words = {"high", "medium", "low", "fast", "thinking", "xhigh"}
     if len(parts) >= 2 and parts[-1].lower() in tier_words:
         base = " ".join(p.capitalize() if not p.isdigit() else p for p in parts[:-1])
         return f"{base} ({parts[-1].capitalize()})"
     return " ".join(p.capitalize() if not p.isdigit() else p for p in parts)
+
+
+def unquote_arg(val: Any) -> str:
+    """清洗 tool_calls.args 中被额外 JSON 编码包裹双引号的字符串参数。"""
+    if val is None:
+        return ""
+    s = str(val).strip()
+    if len(s) >= 2 and s.startswith('"') and s.endswith('"'):
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, str):
+                return parsed.strip()
+        except json.JSONDecodeError:
+            return s[1:-1].strip()
+    return s
 
 
 def parse_iso_ms(ts: str | None) -> float | None:
@@ -108,12 +136,193 @@ def load_transcript(path: str) -> list[dict[str, Any]]:
     return steps
 
 
+def infer_brain_and_conv_id(transcript_path: str) -> tuple[str | None, str | None]:
+    """从 transcript.jsonl 路径反推 brain 根目录与当前 conversationId。"""
+    abs_path = os.path.abspath(transcript_path)
+    # 标准路径：<brain_dir>/<conv_id>/.system_generated/logs/transcript.jsonl
+    logs_dir = os.path.dirname(abs_path)
+    sys_dir = os.path.dirname(logs_dir)
+    conv_dir = os.path.dirname(sys_dir)
+    brain_dir = os.path.dirname(conv_dir)
+    conv_id = os.path.basename(conv_dir)
+    if ID_RE.match(conv_id) and os.path.isdir(brain_dir):
+        return brain_dir, conv_id
+    return None, None
+
+
+def strip_generic_timestamp_headers(content: str) -> str:
+    """剥离 GENERIC 步骤顶部连续的 Created At / Completed At 行，返回正文起始内容。"""
+    lines = content.splitlines()
+    idx = 0
+    while idx < len(lines):
+        trimmed = lines[idx].strip()
+        if not trimmed or trimmed.startswith("Created At:") or trimmed.startswith("Completed At:"):
+            idx += 1
+            continue
+        break
+    return "\n".join(lines[idx:]).lstrip()
+
+
+def extract_subagent_refs_from_step(
+    tool_calls: list[dict[str, Any]],
+    generic_steps: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """从单步 PLANNER_RESPONSE 与紧随的 GENERIC 输出中提取子智能体派发信息。"""
+    refs: list[dict[str, Any]] = []
+    invoke_calls: list[dict[str, str]] = []
+    swarm_add_count = 0
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        tname = tc.get("name")
+        args = tc.get("args") or tc.get("arguments") or {}
+        if not isinstance(args, dict):
+            args = {}
+        if tname == "invoke_subagent":
+            invoke_calls.append(
+                {
+                    "type_name": unquote_arg(args.get("TypeName")),
+                    "role": unquote_arg(args.get("Role")),
+                    "model": unquote_arg(args.get("Model")),
+                }
+            )
+        elif tname == "swarm" and unquote_arg(args.get("action")).lower() == "add":
+            swarm_add_count += 1
+
+    # 当前步骤未调用 invoke_subagent 或 swarm add 时直接返回，避免误匹配命令输出
+    if not invoke_calls and swarm_add_count == 0:
+        return refs
+
+    invoke_cursor = 0
+    for g_step in generic_steps:
+        content = str(g_step.get("content") or "")
+        if not content:
+            continue
+        body = strip_generic_timestamp_headers(content)
+        if not body:
+            continue
+
+        # 1. 严格匹配以 "Created the following subagent:" 开头的 invoke_subagent 返回
+        if invoke_cursor < len(invoke_calls) and body.startswith("Created the following subagent:"):
+            conv_id = ""
+            m = SUBAGENT_CREATED_RE.search(body)
+            if m:
+                try:
+                    parsed = json.loads(m.group(1))
+                    if isinstance(parsed, dict) and isinstance(parsed.get("conversationId"), str):
+                        conv_id = parsed["conversationId"].strip()
+                except json.JSONDecodeError:
+                    pass
+            if not conv_id:
+                idm = CONV_ID_FIELD_RE.search(body)
+                if idm:
+                    conv_id = idm.group(1)
+            if conv_id and ID_RE.match(conv_id):
+                meta = invoke_calls[invoke_cursor] if invoke_cursor < len(invoke_calls) else {}
+                invoke_cursor += 1
+                refs.append(
+                    {
+                        "conversation_id": conv_id,
+                        "kind": "subagent",
+                        "type_name": meta.get("type_name", ""),
+                        "role": meta.get("role", ""),
+                        "model": meta.get("model", ""),
+                    }
+                )
+            continue
+
+        # 2. 严格匹配以 JSON 对象开头的 swarm add 返回
+        if (
+            swarm_add_count > 0
+            and body.startswith("{")
+            and '"status"' in body
+            and '"added"' in body
+            and "conversation_id" in body
+        ):
+            candidate = body.strip()
+            items: list[dict[str, Any]] = []
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    if isinstance(parsed.get("conversation_id"), str):
+                        items.append(parsed)
+                    elif isinstance(parsed.get("added"), list):
+                        items.extend(x for x in parsed["added"] if isinstance(x, dict))
+                    elif isinstance(parsed.get("members"), list):
+                        items.extend(x for x in parsed["members"] if isinstance(x, dict))
+            except json.JSONDecodeError:
+                pass
+            if items:
+                for item in items:
+                    cid = str(item.get("conversation_id") or "").strip()
+                    if not cid or not ID_RE.match(cid):
+                        continue
+                    refs.append(
+                        {
+                            "conversation_id": cid,
+                            "kind": "swarm",
+                            "type_name": "swarm",
+                            "role": str(item.get("name") or "").strip(),
+                            "model": str(item.get("model_display_name") or item.get("model") or "").strip(),
+                        }
+                    )
+            else:
+                idm = CONV_ID_FIELD_RE.search(candidate)
+                if idm and ID_RE.match(idm.group(1)):
+                    refs.append(
+                        {
+                            "conversation_id": idm.group(1),
+                            "kind": "swarm",
+                            "type_name": "swarm",
+                            "role": "",
+                            "model": "",
+                        }
+                    )
+
+    return refs
+
+
+def read_swarm_members_fallback(brain_dir: str, conv_id: str) -> list[dict[str, Any]]:
+    """读取可选的 swarm/members.json，兜底补全可能漏掉的 worker 对话。"""
+    members_path = os.path.join(brain_dir, conv_id, ".system_generated", "swarm", "members.json")
+    if not os.path.isfile(members_path):
+        return []
+    try:
+        with open(members_path, "r", encoding="utf-8", errors="replace") as f:
+            raw = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    members = raw.get("members") if isinstance(raw, dict) else None
+    if not isinstance(members, dict):
+        return []
+    refs: list[dict[str, Any]] = []
+    for name, info in members.items():
+        if not isinstance(info, dict):
+            continue
+        cid = str(info.get("conversation_id") or "").strip()
+        if not cid or not ID_RE.match(cid) or cid == conv_id:
+            continue
+        refs.append(
+            {
+                "conversation_id": cid,
+                "kind": "swarm",
+                "type_name": "swarm",
+                "role": str(name),
+                "model": str(info.get("applied_model") or info.get("model") or info.get("desired_model") or "").strip(),
+            }
+        )
+    return refs
+
+
 def analyze_steps(
     steps: list[dict[str, Any]], now_ms: float | None = None
 ) -> dict[str, Any] | None:
+    """解析单个对话的步骤序列，统计各轮/各步用量并提取派发的子智能体引用。"""
     turns: list[list[dict[str, Any]]] = []
     current_turn: list[dict[str, Any]] = []
     all_invocations: list[dict[str, Any]] = []
+    subagent_refs: list[dict[str, Any]] = []
+    seen_sub_ids: set[str] = set()
 
     i = 0
     n = len(steps)
@@ -140,8 +349,9 @@ def analyze_steps(
             tool_calls = step.get("tool_calls") or []
             start_ms = parse_iso_ms(step.get("created_at"))
 
-            # Scan steps following this PLANNER_RESPONSE until next model/user step
+            # 扫描当前 PLANNER_RESPONSE 之后、下一个模型/用户输入之前的所有步骤
             tool_intervals: list[tuple[float, float]] = []
+            following_generics: list[dict[str, Any]] = []
             first_tool_ms: float | None = None
             first_sys_ms: float | None = None
             j = i + 1
@@ -153,6 +363,7 @@ def analyze_steps(
                 ntype = nxt.get("type")
                 nts = parse_iso_ms(nxt.get("created_at"))
                 if ntype == "GENERIC":
+                    following_generics.append(nxt)
                     content = str(nxt.get("content") or "")
                     head = content[:300]
                     cm = CREATED_RE.search(head)
@@ -167,9 +378,14 @@ def analyze_steps(
                     first_sys_ms = nts
                 j += 1
 
+            for ref in extract_subagent_refs_from_step(tool_calls, following_generics):
+                cid = ref["conversation_id"]
+                if cid not in seen_sub_ids:
+                    seen_sub_ids.add(cid)
+                    subagent_refs.append(ref)
+
             tool_ms = merge_intervals_ms(tool_intervals)
 
-            # Determine model duration for this step
             model_ms = 0.0
             if start_ms is not None:
                 end_ms: float | None = None
@@ -178,7 +394,7 @@ def analyze_steps(
                 elif first_sys_ms is not None:
                     end_ms = first_sys_ms
                 elif j == n and now_ms is not None:
-                    # Live PostInvocation firing right as final reply completes
+                    # 实时 PostInvocation 触发时，以当前时间作为最后一步回复结束时刻
                     end_ms = now_ms
                 if end_ms is not None and 0 <= (end_ms - start_ms) <= 600_000:
                     model_ms = end_ms - start_ms
@@ -215,10 +431,94 @@ def analyze_steps(
         "current_turn": turns[-1],
         "all_invocations": all_invocations,
         "last": all_invocations[-1],
+        "subagent_refs": subagent_refs,
     }
 
 
-def build_end_of_turn_markdown(summary: dict[str, Any]) -> str:
+def collect_subagents_recursive(
+    transcript_path: str,
+    root_refs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """递归加载当前主对话派发的所有子孙智能体 transcript 并汇总其用量。"""
+    brain_dir, root_conv_id = infer_brain_and_conv_id(transcript_path)
+    if not brain_dir or not root_conv_id:
+        return []
+
+    visited: set[str] = {root_conv_id}
+    collected: list[dict[str, Any]] = []
+
+    def walk(parent_id: str, direct_refs: list[dict[str, Any]], depth: int) -> None:
+        if depth > MAX_SUBAGENT_DEPTH or len(collected) >= MAX_SUBAGENT_COUNT:
+            return
+
+        # 合并 swarm/members.json 兜底记录
+        merged = list(direct_refs)
+        existing = {r["conversation_id"] for r in direct_refs}
+        for fb in read_swarm_members_fallback(brain_dir, parent_id):
+            if fb["conversation_id"] not in existing:
+                existing.add(fb["conversation_id"])
+                merged.append(fb)
+
+        for ref in merged:
+            if len(collected) >= MAX_SUBAGENT_COUNT:
+                break
+            cid = ref["conversation_id"]
+            if cid in visited:
+                continue
+            visited.add(cid)
+
+            sub_path = os.path.join(brain_dir, cid, ".system_generated", "logs", "transcript.jsonl")
+            sub_summary: dict[str, Any] | None = None
+            if os.path.isfile(sub_path):
+                try:
+                    mtime_ms = os.path.getmtime(sub_path) * 1000.0
+                    sub_steps = load_transcript(sub_path)
+                    sub_summary = analyze_steps(sub_steps, now_ms=mtime_ms)
+                except OSError:
+                    sub_summary = None
+
+            invs = sub_summary["all_invocations"] if sub_summary else []
+            s_inp = sum(x["input_tokens"] for x in invs)
+            s_cache = sum(x["cache_read_tokens"] for x in invs)
+            s_out = sum(x["output_tokens"] for x in invs)
+            s_model_ms = sum(x["model_ms"] for x in invs)
+            s_tool_ms = sum(x["tool_ms"] for x in invs)
+            label = (
+                f"swarm: {ref['role']}"
+                if ref["kind"] == "swarm" and ref.get("role")
+                else (ref.get("role") or ref.get("type_name") or f"subagent-{cid[:6]}")
+            )
+            model_raw = invs[-1]["model"] if invs else ref.get("model", "")
+
+            collected.append(
+                {
+                    "conversation_id": cid,
+                    "depth": depth,
+                    "kind": ref["kind"],
+                    "label": label,
+                    "model": fmt_model(model_raw),
+                    "steps": len(invs),
+                    "input_tokens": s_inp,
+                    "cache_read_tokens": s_cache,
+                    "output_tokens": s_out,
+                    "total_tokens": s_inp + s_cache + s_out,
+                    "model_ms": s_model_ms,
+                    "tool_ms": s_tool_ms,
+                }
+            )
+
+            if sub_summary:
+                walk(cid, sub_summary.get("subagent_refs") or [], depth + 1)
+
+    walk(root_conv_id, root_refs, 1)
+    return collected
+
+
+def build_end_of_turn_markdown(
+    summary: dict[str, Any],
+    subagents: list[dict[str, Any]] | None = None,
+) -> str:
+    """构造每轮结束时注入聊天流的精简 Markdown 统计表格。"""
     turn = summary["current_turn"]
     turns = summary["turns"]
     all_inv = summary["all_invocations"]
@@ -233,7 +533,7 @@ def build_end_of_turn_markdown(summary: dict[str, Any]) -> str:
     turn_model_ms = sum(x["model_ms"] for x in turn)
     turn_tool_ms = sum(x["tool_ms"] for x in turn)
 
-    # Highlight if any non-first step in this turn experienced full cache miss
+    # 非首步出现整步缓存未命中时高亮提示
     has_cache_miss = any(
         x["seq"] > 1 and x["cache_read_tokens"] == 0 and x["input_tokens"] >= 5000
         for x in turn
@@ -260,21 +560,60 @@ def build_end_of_turn_markdown(summary: dict[str, Any]) -> str:
     turn_time = f"{fmt_duration(turn_model_ms)} / {turn_tool_str}"
     sess_time = f"{fmt_duration(sess_model_ms)} / {sess_tool_str}"
 
+    rows = [
+        "| 维度 | 总用量 | 缓存命中 | 未缓存 | 缓存读 | 输出 | 耗时 (模型 / 工具) |",
+        "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        (
+            f"| **本轮** ({turn_steps}步) | **{fmt_num(turn_total)}** | "
+            f"**{turn_hit}**{miss_badge} | {fmt_num(turn_inp)} | "
+            f"{fmt_num(turn_cache)} | {fmt_num(turn_out)} | {turn_time} |"
+        ),
+        (
+            f"| **会话** ({sess_turns}轮 {sess_steps}步) | **{fmt_num(sess_total)}** | "
+            f"**{sess_hit}** | {fmt_num(sess_inp)} | "
+            f"{fmt_num(sess_cache)} | {fmt_num(sess_out)} | {sess_time} |"
+        ),
+    ]
+
+    # 存在子智能体时，追加「子代理」和「总计」两行；无子智能体时保持原有极简表格
+    if subagents:
+        sub_count = len(subagents)
+        sub_steps = sum(x["steps"] for x in subagents)
+        sub_inp = sum(x["input_tokens"] for x in subagents)
+        sub_cache = sum(x["cache_read_tokens"] for x in subagents)
+        sub_out = sum(x["output_tokens"] for x in subagents)
+        sub_total = sub_inp + sub_cache + sub_out
+        sub_hit = fmt_pct(sub_cache, sub_inp + sub_cache)
+        sub_model_ms = sum(x["model_ms"] for x in subagents)
+        sub_tool_ms = sum(x["tool_ms"] for x in subagents)
+        sub_tool_str = fmt_duration(sub_tool_ms) if sub_tool_ms >= 50 else "-"
+        sub_time = f"{fmt_duration(sub_model_ms)} / {sub_tool_str}"
+
+        comb_steps = sess_steps + sub_steps
+        comb_inp = sess_inp + sub_inp
+        comb_cache = sess_cache + sub_cache
+        comb_out = sess_out + sub_out
+        comb_total = comb_inp + comb_cache + comb_out
+        comb_hit = fmt_pct(comb_cache, comb_inp + comb_cache)
+        comb_model_ms = sess_model_ms + sub_model_ms
+        comb_tool_ms = sess_tool_ms + sub_tool_ms
+        comb_tool_str = fmt_duration(comb_tool_ms) if comb_tool_ms >= 50 else "-"
+        comb_time = f"{fmt_duration(comb_model_ms)} / {comb_tool_str}"
+
+        rows.append(
+            f"| **子代理** ({sub_count}个 {sub_steps}步) | **{fmt_num(sub_total)}** | "
+            f"**{sub_hit}** | {fmt_num(sub_inp)} | "
+            f"{fmt_num(sub_cache)} | {fmt_num(sub_out)} | {sub_time} |"
+        )
+        rows.append(
+            f"| **总计** ({comb_steps}步) | **{fmt_num(comb_total)}** | "
+            f"**{comb_hit}** | {fmt_num(comb_inp)} | "
+            f"{fmt_num(comb_cache)} | {fmt_num(comb_out)} | {comb_time} |"
+        )
+
     model_label = fmt_model(last.get("model"))
-    table = "\n".join(
+    rows.extend(
         [
-            "| 维度 | 总用量 | 缓存命中 | 未缓存 | 缓存读 | 输出 | 耗时 (模型 / 工具) |",
-            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
-            (
-                f"| **本轮** ({turn_steps}步) | **{fmt_num(turn_total)}** | "
-                f"**{turn_hit}**{miss_badge} | {fmt_num(turn_inp)} | "
-                f"{fmt_num(turn_cache)} | {fmt_num(turn_out)} | {turn_time} |"
-            ),
-            (
-                f"| **会话** ({sess_turns}轮 {sess_steps}步) | **{fmt_num(sess_total)}** | "
-                f"**{sess_hit}** | {fmt_num(sess_inp)} | "
-                f"{fmt_num(sess_cache)} | {fmt_num(sess_out)} | {sess_time} |"
-            ),
             "",
             (
                 f"模型 `{model_label}`{tps_part} · "
@@ -282,7 +621,7 @@ def build_end_of_turn_markdown(summary: dict[str, Any]) -> str:
             ),
         ]
     )
-    return f"{table}{INVISIBLE_MARKER}"
+    return f"{chr(10).join(rows)}{INVISIBLE_MARKER}"
 
 
 def resolve_transcript_path(payload: dict[str, Any]) -> str | None:
@@ -308,6 +647,8 @@ def print_cli_report(path: str) -> None:
         print("No PLANNER_RESPONSE steps with token usage found.")
         return
 
+    subagents = collect_subagents_recursive(path, summary.get("subagent_refs") or [])
+
     print(f"Transcript: {path}")
     print(
         f"{'Step':>4} | {'Uncached':>8} | {'CacheRd':>8} | {'Hit%':>6} | "
@@ -322,8 +663,22 @@ def print_cli_report(path: str) -> None:
             f"{fmt_num(inv['output_tokens']):>6} | "
             f"{fmt_duration(inv['model_ms']):>7} | {fmt_duration(inv['tool_ms']):>7}"
         )
+
+    if subagents:
+        print("-" * 64)
+        print(f"Subagents ({len(subagents)}):")
+        for sa in subagents:
+            indent = "  " * max(0, sa["depth"] - 1)
+            hit = fmt_pct(sa["cache_read_tokens"], sa["input_tokens"] + sa["cache_read_tokens"])
+            print(
+                f"{indent}- {sa['label']} [{sa['conversation_id'][:8]}] "
+                f"steps={sa['steps']} total={fmt_num(sa['total_tokens'])} "
+                f"hit={hit} out={fmt_num(sa['output_tokens'])} "
+                f"time={fmt_duration(sa['model_ms'])}/{fmt_duration(sa['tool_ms'])}"
+            )
+
     print("-" * 64)
-    print(build_end_of_turn_markdown(summary))
+    print(build_end_of_turn_markdown(summary, subagents=subagents))
 
 
 def run_hook() -> dict[str, Any]:
@@ -345,18 +700,21 @@ def run_hook() -> dict[str, Any]:
     if not summary:
         return {}
 
-    # Silent on intermediate tool-calling steps; only inject once at end of turn
+    # 中间工具调用步骤保持静默，仅在每轮最终回复后注入一次
     if summary["last"]["has_tools"]:
         return {}
 
-    # Guard against duplicate injection for the same PLANNER_RESPONSE
+    # 防止对同一条 PLANNER_RESPONSE 重复注入
     last_end_idx = summary["last"]["raw_end_idx"]
     for trailing in steps[last_end_idx + 1 :]:
         content = str(trailing.get("content") or "")
         if INVISIBLE_MARKER in content:
             return {}
 
-    md = build_end_of_turn_markdown(summary)
+    subagents = collect_subagents_recursive(
+        transcript_path, summary.get("subagent_refs") or []
+    )
+    md = build_end_of_turn_markdown(summary, subagents=subagents)
     return {
         "injectSteps": [
             {
@@ -381,7 +739,7 @@ def main() -> None:
         result = run_hook()
     except Exception:
         result = {}
-    # Use ASCII-escaped JSON to avoid Windows console codepage issues
+    # 输出 ASCII 转义 JSON，避免 Windows 控制台代码页乱码
     sys.stdout.write(json.dumps(result, ensure_ascii=True))
     sys.stdout.flush()
 
