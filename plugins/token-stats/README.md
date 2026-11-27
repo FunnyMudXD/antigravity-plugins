@@ -14,5 +14,5 @@
 ## 命令行复盘
 
 ```powershell
-python ~/.gemini/config/plugins/token-stats/scripts/token_stats.py --file "<transcript.jsonl路径>"
+python plugins/token-stats/scripts/token_stats.py --file "<transcript.jsonl路径>"
 ```

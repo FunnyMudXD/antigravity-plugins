@@ -1,0 +1,5 @@
+# 默认文本文件使用 LF，避免跨平台无意义换行符 diff
+* text=auto eol=lf
+
+# Windows PowerShell 脚本保持 CRLF 兼容性
+*.ps1 text eol=crlf

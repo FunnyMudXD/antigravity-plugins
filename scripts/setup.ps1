@@ -26,6 +26,10 @@ Write-Host "仓库根目录: $repoRoot" -ForegroundColor Cyan
 if (-not $SkipBuild) {
     $codexDir = Join-Path $pluginsDir "codex-bridge"
     if (Test-Path (Join-Path $codexDir "package.json")) {
+        if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+            throw "未检测到 npm，请先安装 Node.js 后重试，或使用 -SkipBuild 跳过前端构建。"
+        }
+
         Write-Host "`n[1/2] 正在安装 codex-bridge 依赖并构建 UI..." -ForegroundColor Yellow
         Push-Location $codexDir
         try {
@@ -34,7 +38,14 @@ if (-not $SkipBuild) {
             } else {
                 npm install
             }
+            if ($LASTEXITCODE -ne 0) {
+                throw "codex-bridge 依赖安装失败（退出码：$LASTEXITCODE）。"
+            }
+
             npm run build:ui
+            if ($LASTEXITCODE -ne 0) {
+                throw "codex-bridge 前端构建失败（退出码：$LASTEXITCODE）。"
+            }
         } finally {
             Pop-Location
         }
@@ -52,21 +63,26 @@ if (-not $SkipRegister) {
         New-Item -ItemType Directory -Force -Path $configDir | Out-Null
     }
 
-    # 读取已有配置，避免覆盖用户原有的 entries 或 inherits
+    # 读取已有配置，避免覆盖用户原有的 entries 或 inherits（兼容空文件）
+    $configObj = [PSCustomObject]@{}
     if (Test-Path $pluginsJsonPath) {
-        $configObj = Get-Content -Path $pluginsJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    } else {
-        $configObj = [PSCustomObject]@{}
+        $rawContent = Get-Content -Path $pluginsJsonPath -Raw -Encoding UTF8
+        if (-not [string]::IsNullOrWhiteSpace($rawContent)) {
+            $configObj = $rawContent | ConvertFrom-Json
+        }
     }
 
-    $entries = @()
+    [System.Collections.ArrayList]$entriesList = @()
     if ($null -ne $configObj.entries) {
-        $entries = @($configObj.entries)
+        foreach ($item in @($configObj.entries)) {
+            [void]$entriesList.Add($item)
+        }
     }
 
     # 统一斜杠与大小写进行去重判断
     $exists = $false
-    foreach ($entry in $entries) {
+    foreach ($entry in $entriesList) {
+        if ($null -eq $entry.path) { continue }
         $existingNormalized = ($entry.path -replace "\\", "/").TrimEnd("/")
         if ($existingNormalized.Equals($pluginsDirPosix.TrimEnd("/"), [System.StringComparison]::OrdinalIgnoreCase)) {
             $exists = $true
@@ -75,11 +91,13 @@ if (-not $SkipRegister) {
     }
 
     if (-not $exists) {
-        $entries += [PSCustomObject]@{ path = $pluginsDirPosix }
+        [void]$entriesList.Add([PSCustomObject]@{ path = $pluginsDirPosix })
+        # 显式转为 [object[]] 确保单元素时也始终序列化为 JSON 数组
+        $entriesArray = [object[]]$entriesList.ToArray()
         if ($configObj.PSObject.Properties["entries"]) {
-            $configObj.entries = $entries
+            $configObj.entries = $entriesArray
         } else {
-            $configObj | Add-Member -MemberType NoteProperty -Name "entries" -Value $entries
+            $configObj | Add-Member -MemberType NoteProperty -Name "entries" -Value $entriesArray
         }
         $jsonText = $configObj | ConvertTo-Json -Depth 10
         [System.IO.File]::WriteAllText($pluginsJsonPath, $jsonText + "`n", [System.Text.UTF8Encoding]::new($false))
