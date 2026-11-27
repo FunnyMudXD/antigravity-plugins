@@ -1,0 +1,11 @@
+{
+  "name": "token-stats",
+  "displayName": "Token & Cache Stats",
+  "version": "1.0.0",
+  "author": {
+    "name": "FunnyMudXD",
+    "url": "https://github.com/FunnyMudXD"
+  },
+  "repository": "https://github.com/FunnyMudXD/antigravity-plugins",
+  "description": "Inline per-turn token usage, thinking/tool breakdown, and prompt cache hit rate tracker via PostInvocation hook with zero model context overhead."
+}

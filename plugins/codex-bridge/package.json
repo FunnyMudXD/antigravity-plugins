@@ -1,0 +1,16 @@
+{
+  "name": "codex-bridge-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Antigravity plugin for orchestrating local codex-cli with an interactive MCP App console.",
+  "scripts": {
+    "build:ui": "node ui/build.mjs",
+    "test": "node --test tests/mcp-server.test.mjs"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/ext-apps": "^1.0.0",
+    "esbuild": "^0.25.0",
+    "zod": "^3.24.0"
+  }
+}

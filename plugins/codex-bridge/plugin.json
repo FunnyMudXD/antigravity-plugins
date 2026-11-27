@@ -1,0 +1,16 @@
+{
+  "name": "codex-bridge",
+  "displayName": "Codex Bridge",
+  "description": "在 Antigravity 中调用本地 codex-cli 指挥 GPT 干活，内置可视化配置与任务指挥台（支持右侧边栏与左侧全屏）。",
+  "version": "0.1.0",
+  "author": {
+    "name": "FunnyMudXD",
+    "url": "https://github.com/FunnyMudXD"
+  },
+  "repository": "https://github.com/FunnyMudXD/antigravity-plugins",
+  "suggestedPrompts": [
+    "打开 Codex 指挥台，检查本机 codex-cli 状态",
+    "把当前需求拆解后交给 Codex 实现，完成后帮我 review 改动",
+    "让 Codex 对当前工作区未提交的改动做一次对抗性代码审查"
+  ]
+}

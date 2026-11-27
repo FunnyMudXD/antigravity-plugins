@@ -1,0 +1,17 @@
+{
+  "name": "customization-manager",
+  "displayName": "Rules & MCP Manager",
+  "version": "1.0.0",
+  "author": {
+    "name": "FunnyMudXD",
+    "url": "https://github.com/FunnyMudXD"
+  },
+  "repository": "https://github.com/FunnyMudXD/antigravity-plugins",
+  "description": "Visual manager for global & workspace rules, hooks, MCP servers, and multi-client configuration links (Antigravity, Claude Code, Codex, Cursor, Qoder).",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "打开全局规则与 MCP 管理面板",
+    "检查各 AI 客户端的全局规则与 MCP 同步状态",
+    "新建一条全局约束并同步到其他 AI 客户端"
+  ]
+}

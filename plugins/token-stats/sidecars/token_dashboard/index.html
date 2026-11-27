@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Token Stats</title>
+  <script src="/preload.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="root" class="shell">
+    <!-- Top compact status strip (inspired by compact bottom bar + clickable popups) -->
+    <header class="topbar">
+      <div class="topbar-head">
+        <div class="title-wrap">
+          <span class="live-dot" id="live-dot" title="实时同步当前对话"></span>
+          <h1 class="title">对话用量统计</h1>
+        </div>
+        <button id="btn-sort" class="icon-btn" type="button" title="切换轮次排序">最新在前</button>
+      </div>
+
+      <div id="pill-bar" class="pill-bar hidden">
+        <button id="pill-perf" class="stat-pill" type="button" title="点击查看会话耗时与性能详情">
+          <svg class="pill-ico" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <circle cx="8" cy="8.5" r="5.5" stroke="currentColor" stroke-width="1.4"/>
+            <path d="M8 5.5v3.2l2 1.2M6.2 2h3.6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+          </svg>
+          <span id="pill-perf-text">--</span>
+        </button>
+        <button id="pill-usage" class="stat-pill" type="button" title="点击查看会话缓存读写明细">
+          <svg class="pill-ico" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <ellipse cx="8" cy="4" rx="5" ry="2" stroke="currentColor" stroke-width="1.4"/>
+            <path d="M3 4v4c0 1.1 2.24 2 5 2s5-.9 5-2V4M3 8v4c0 1.1 2.24 2 5 2s5-.9 5-2V8" stroke="currentColor" stroke-width="1.4"/>
+          </svg>
+          <span id="pill-usage-text">--</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Loading / Empty -->
+    <section id="empty-state" class="empty-state">
+      <div class="empty-title" id="empty-title">正在读取当前对话统计…</div>
+      <div class="empty-sub" id="empty-sub">发起一次对话后这里会自动更新缓存命中率与耗时。</div>
+    </section>
+
+    <!-- Main content -->
+    <main id="content" class="content hidden">
+      <!-- Compact Session Summary Card -->
+      <section class="card summary-card">
+        <div class="card-head">
+          <span class="card-label">本会话总览</span>
+          <span id="ctx-badge" class="ctx-badge" title="最近一步输入上下文总大小">上下文 --</span>
+        </div>
+
+        <div class="hit-bar-wrap">
+          <div class="hit-bar-meta">
+            <span class="muted">缓存命中率</span>
+            <span id="sum-hit" class="mono strong">--</span>
+          </div>
+          <div class="hit-bar-track">
+            <div id="sum-hit-fill" class="hit-bar-fill" style="width: 0%"></div>
+          </div>
+        </div>
+
+        <div class="kv-grid">
+          <div class="kv-cell">
+            <span class="kv-k">未缓存输入</span>
+            <span id="sum-in" class="kv-v mono">--</span>
+          </div>
+          <div class="kv-cell">
+            <span class="kv-k">缓存读取</span>
+            <span id="sum-cache" class="kv-v mono">--</span>
+          </div>
+          <div class="kv-cell">
+            <span class="kv-k">输出</span>
+            <span id="sum-out" class="kv-v mono">--</span>
+          </div>
+          <div class="kv-cell">
+            <span class="kv-k">模型 / 工具耗时</span>
+            <span id="sum-time" class="kv-v mono">--</span>
+          </div>
+        </div>
+
+        <div id="miss-banner" class="miss-banner hidden"></div>
+      </section>
+
+      <!-- Per-turn list -->
+      <section class="turns-section">
+        <div class="section-head">
+          <span class="card-label">逐轮用量（点击查看详情）</span>
+          <span id="turns-count" class="muted mono">0 轮</span>
+        </div>
+        <div id="turns-list" class="turns-list"></div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Detail Modal (replicates the crisp dark key-value popup in screenshots) -->
+  <div id="modal-backdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-card" id="modal-card">
+      <div class="modal-head">
+        <div class="modal-title-row">
+          <span id="modal-icon" class="modal-icon"></span>
+          <span id="modal-title" class="modal-title">本轮用量</span>
+        </div>
+        <div class="modal-head-right">
+          <span id="modal-badge" class="modal-badge mono"></span>
+          <button id="modal-close" class="modal-close" type="button" aria-label="关闭">×</button>
+        </div>
+      </div>
+      <div class="modal-divider"></div>
+      <div id="modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

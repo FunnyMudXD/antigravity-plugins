@@ -1,0 +1,11 @@
+{
+  "token-stats": {
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "python scripts/token_stats.py",
+        "timeout": 5
+      }
+    ]
+  }
+}
