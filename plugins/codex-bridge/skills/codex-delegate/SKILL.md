@@ -17,7 +17,7 @@ description: 将代码编写、重构、排障或只读调研任务委派给本�
    - 纯代码分析、根因排查、方案对比：传 `sandbox: "read-only"`（或使用 `preset_id: "readonly-research"`）。
    - 日常功能开发、Bug 修复：传 `sandbox: "workspace-write"`（或 `preset_id: "daily-coding"`）。
    - 高风险重构、实验性改造：传 `sandbox: "workspace-write"` + `worktree: true`（或 `preset_id: "worktree-refactor"`）。
-   - 为方便用户在右侧「Codex 指挥台」实时观看你下达的指令与 GPT 的执行时间线，建议默认传 `background: true` 并带上当前上下文的 `conversation_id` 拿到 `job_id` 后，立刻调用 `open_codex_console(focusTab: "monitor", jobId: <job_id>, cwd: <当前工作区绝对路径>, conversation_id: <当前对话ID>)` 实现按对话隔离聚焦，再调用 `codex_job_status(job_id: <job_id>, wait_sec: 90)` 长等待直至完成（避免反复空轮询浪费 Token）。
+   - 为方便用户在右侧「Codex 指挥台」实时观看你下达的指令与 GPT 的执行时间线，无论是首次 `codex_exec` / `codex_review`，还是后续任意一轮 `codex_resume` 返工，都默认传 `background: true` 并带上当前上下文的 `conversation_id`；拿到新的 `job_id` 后，**每轮都必须立刻再次调用** `open_codex_console(focusTab: "monitor", jobId: <新job_id>, cwd: <当前工作区绝对路径>, conversation_id: <当前对话ID>)` 重新同步对话绑定并聚焦到新任务，再调用 `codex_job_status(job_id: <job_id>, wait_sec: 90)` 长等待直至完成（避免反复空轮询浪费 Token）。
    - 如果本轮任务涉及其他领域技能（如 `rpx-to-ureport`、`gssy-phase2` 等），在调用 `codex_exec` 时传入 `skills: ["<skill-name>"]`（由服务端自动注入只读路径与脚本清单），并在 `prompt` 中提炼核心红线摘要。
    - 给 GPT 派发写码任务时，在 `prompt` 中明确声明“当前为非交互式环境，请勿反问确认或仅输出建议，直接在限定文件范围内落盘修改并验证”，并按任务复杂度选择 `reasoning_effort`（`low`/`medium`/`high`）。如果返回结果中 `changedFiles` 为空且只给出了文字建议，立即用 `threadId` 调 `codex_resume` 要求直接落盘。
 

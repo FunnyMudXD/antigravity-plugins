@@ -105,6 +105,7 @@ export class JobStore {
       worktree: Boolean(params.worktree),
       conversationId: String(params.conversationId || '').trim(),
       conversationTitle: String(params.conversationTitle || '').trim().slice(0, 80),
+      projectName: String(params.projectName || '').trim().slice(0, 120),
       skills: Array.isArray(params.skills) ? params.skills.filter(Boolean) : [],
       missingSkills: Array.isArray(params.missingSkills) ? params.missingSkills.filter(Boolean) : [],
       addDirs: Array.isArray(params.addDirs) ? params.addDirs.filter(Boolean) : [],
@@ -366,6 +367,30 @@ export class JobStore {
   }
 
   /**
+   * 为尚未绑定对话 ID 的任务补齐 conversationId（仅在原字段为空时生效，避免覆盖既有归属）
+   * @param {string} jobId 任务 ID
+   * @param {string} conversationId 目标对话 ID
+   * @param {string} [conversationTitle] 对话标题（可选）
+   * @returns {object|null} 更新后的任务快照
+   */
+  bindJobConversation(jobId, conversationId, conversationTitle = '') {
+    const job = this.jobs.get(jobId);
+    const cleanedConvId = String(conversationId || '').trim();
+    if (!job || !cleanedConvId) return null;
+    if (String(job.conversationId || '').trim()) {
+      return this.getJob(jobId);
+    }
+    job.conversationId = cleanedConvId;
+    const cleanedTitle = String(conversationTitle || '').trim().slice(0, 80);
+    if (cleanedTitle && !job.conversationTitle) {
+      job.conversationTitle = cleanedTitle;
+    }
+    job.updatedAt = new Date().toISOString();
+    this.#persist();
+    return this.getJob(jobId);
+  }
+
+  /**
    * 根据 Codex 会话 threadId 查找最近一条匹配的任务，用于返工时自动继承原对话 ID
    * @param {string} threadId Codex 会话线程 ID
    * @returns {object|null} 匹配的任务快照
@@ -392,20 +417,43 @@ export class JobStore {
   }
 
   /**
-   * 删除单条或全部已完成的历史任务（支持按对话 ID 或项目目录筛选）
+   * 删除单条或全部已完成的历史任务（支持按对话 ID、任务 ID 集合、单目录、多文件夹分组目录列表或显式项目名筛选）
    * @param {string|undefined} jobId 指定任务 ID；若传 "ALL_FINISHED" 则清空所有非运行中任务
-   * @param {string|{ cwd?: string, conversationId?: string }} [filter] 可选过滤条件（兼容旧版纯 cwd 字符串）
+   * @param {string|{ cwd?: string, cwds?: string[], projectName?: string, conversationId?: string, jobIds?: string[] }} [filter] 可选过滤条件（兼容旧版纯 cwd 字符串）
    * @returns {{ deletedCount: number }} 删除条数
    */
   deleteJob(jobId, filter = '') {
     if (jobId === 'ALL_FINISHED') {
       const cwdFilter = typeof filter === 'string' ? filter : filter?.cwd || '';
+      const cwdsFilter =
+        typeof filter === 'object' && filter && Array.isArray(filter.cwds) ? filter.cwds : [];
+      const projectNameFilter =
+        typeof filter === 'object' && filter ? String(filter.projectName || '').trim().toLowerCase() : '';
       const convFilter = typeof filter === 'object' && filter ? String(filter.conversationId || '').trim() : '';
+      const jobIdsFilter =
+        typeof filter === 'object' && filter && Array.isArray(filter.jobIds) ? filter.jobIds : [];
       const targetKey = normalizeProjectPath(cwdFilter);
+      const targetCwdKeys = new Set(
+        cwdsFilter.map((item) => normalizeProjectPath(item)).filter(Boolean),
+      );
+      const targetJobIds = new Set(
+        jobIdsFilter.map((item) => String(item || '').trim()).filter(Boolean),
+      );
       let deletedCount = 0;
       for (const [id, job] of this.jobs.entries()) {
         if (job.status !== 'running') {
-          if (convFilter && String(job.conversationId || '').trim() !== convFilter) {
+          // 当同时传入 conversationId 或 jobIds 时取并集匹配，确保侧边栏中补绑的无对话 ID 任务也能被一并清理
+          if (convFilter || targetJobIds.size > 0) {
+            const matchConv = Boolean(convFilter) && String(job.conversationId || '').trim() === convFilter;
+            const matchJobId = targetJobIds.has(id);
+            if (!matchConv && !matchJobId) {
+              continue;
+            }
+          }
+          if (projectNameFilter && String(job.projectName || '').trim().toLowerCase() !== projectNameFilter) {
+            continue;
+          }
+          if (targetCwdKeys.size > 0 && !targetCwdKeys.has(normalizeProjectPath(job.cwd))) {
             continue;
           }
           if (targetKey && normalizeProjectPath(job.cwd) !== targetKey) {

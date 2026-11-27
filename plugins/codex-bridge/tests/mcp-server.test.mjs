@@ -569,3 +569,115 @@ test('JobStore 与 open_codex_console 应支持按对话 ID 隔离清理、返�
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('全局空参数打开不伪造当前项目，open_codex_console 可补绑无对话任务，且支持多目录分组清理', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-global-group-'));
+  // 先预先在磁盘写入 3 条测试任务，再启动 MCP Server 检验读取、补绑与分组清理
+  const seedStore = new JobStore(tmpDir);
+  const jUnbound = seedStore.createJob({
+    kind: 'exec',
+    cwd: 'D:\\Work\\changjia\\applets',
+    prompt: 'applets task',
+  });
+  const jSibling = seedStore.createJob({
+    kind: 'exec',
+    cwd: 'D:\\Work\\changjia\\CheYongRanQiServer',
+    conversationId: 'conv_other',
+    prompt: 'server task',
+  });
+  const jOtherProj = seedStore.createJob({
+    kind: 'exec',
+    cwd: 'D:\\Work\\game1',
+    conversationId: 'conv_game',
+    prompt: 'game task',
+  });
+  seedStore.finishJob(jUnbound.id, 'completed', { exitCode: 0 });
+  seedStore.finishJob(jSibling.id, 'completed', { exitCode: 0 });
+  seedStore.finishJob(jOtherProj.id, 'completed', { exitCode: 0 });
+
+  const client = createMcpTestClient(tmpDir);
+  try {
+    // 1. 全局空参数打开：不应把最近任务目录伪造为 activeProjectCwd
+    const globalOpen = await client.request('tools/call', {
+      name: 'open_codex_console',
+      arguments: {},
+    });
+    assert.equal(globalOpen.result.structuredContent.activeProjectCwd, '');
+
+    // 2. open_codex_console 传入 jobId + conversation_id 时，自动为原无 conversationId 的任务补绑
+    const bindOpen = await client.request('tools/call', {
+      name: 'open_codex_console',
+      arguments: {
+        jobId: jUnbound.id,
+        conversation_id: 'conv_bound',
+        conversation_title: '补绑测试',
+      },
+    });
+    const boundJob = bindOpen.result.structuredContent.jobs.find((j) => j.id === jUnbound.id);
+    assert.equal(boundJob?.conversationId, 'conv_bound');
+    assert.equal(boundJob?.conversationTitle, '补绑测试');
+
+    // 已绑定 conversationId 的任务不应被二次误覆盖
+    const retryOpen = await client.request('tools/call', {
+      name: 'open_codex_console',
+      arguments: {
+        jobId: jSibling.id,
+        conversation_id: 'conv_hijack',
+      },
+    });
+    const untouchedJob = retryOpen.result.structuredContent.jobs.find((j) => j.id === jSibling.id);
+    assert.equal(untouchedJob?.conversationId, 'conv_other');
+
+    // 3. 多文件夹分组批量清理（cwds 数组）：一次性清空 changjia 下两个子目录，保留 game1
+    const delRes = await client.request('tools/call', {
+      name: 'app_delete_job',
+      arguments: {
+        job_id: 'ALL_FINISHED',
+        cwds: ['D:\\Work\\changjia\\applets', 'D:\\Work\\changjia\\CheYongRanQiServer'],
+      },
+    });
+    assert.equal(delRes.result.structuredContent.deletedCount, 2);
+    assert.equal(delRes.result.structuredContent.jobs.length, 1);
+    assert.equal(delRes.result.structuredContent.jobs[0].id, jOtherProj.id);
+
+    // 4. 验证 conversation_id 与 job_ids 联合清理，以及 projectName 大小写不敏感清理
+    const localStore = new JobStore(tmpDir);
+    const jLoose = localStore.createJob({
+      kind: 'exec',
+      cwd: 'D:\\Work\\misc',
+      prompt: 'unbound job',
+    });
+    const jNamed = localStore.createJob({
+      kind: 'exec',
+      cwd: 'D:\\Work\\other-dir',
+      projectName: 'ChangJia',
+      prompt: 'named project job',
+    });
+    localStore.finishJob(jLoose.id, 'completed', { exitCode: 0 });
+    localStore.finishJob(jNamed.id, 'completed', { exitCode: 0 });
+
+    const unionDel = localStore.deleteJob('ALL_FINISHED', {
+      conversationId: 'pane_temp_1',
+      jobIds: [jLoose.id],
+    });
+    assert.equal(unionDel.deletedCount, 1);
+    assert.equal(localStore.getJob(jLoose.id), null);
+
+    const caseInsensitiveDel = localStore.deleteJob('ALL_FINISHED', {
+      projectName: 'changjia',
+    });
+    assert.equal(caseInsensitiveDel.deletedCount, 1);
+    assert.equal(localStore.getJob(jNamed.id), null);
+
+    // 5. 验证已结束任务的 codex_job_status 返回文本不应冗余附带 open_codex_console 同步提示
+    const statusRes = await client.request('tools/call', {
+      name: 'codex_job_status',
+      arguments: { job_id: jOtherProj.id },
+    });
+    const statusText = statusRes.result.content?.[0]?.text || '';
+    assert.equal(statusText.includes('下一步同步监控'), false);
+  } finally {
+    client.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

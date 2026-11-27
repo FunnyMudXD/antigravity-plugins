@@ -43,6 +43,7 @@ interface JobItem {
   cwd: string;
   conversationId?: string;
   conversationTitle?: string;
+  projectName?: string;
   presetId: string;
   model: string;
   sandbox: string;
@@ -75,8 +76,10 @@ interface ProjectOption {
   key: string;
   path: string;
   name: string;
+  subNames: string[];
+  cwds: string[];
+  projectName?: string;
   count: number;
-  isCurrent: boolean;
 }
 
 interface DoctorReport {
@@ -130,10 +133,9 @@ const state = {
   activeProjectCwd: '',
   activeConversationId: '',
   activeConversationTitle: '',
-  scopeMode: 'project' as ScopeMode,
-  scopeTouched: false,
+  boundJobIds: [] as string[],
+  scopeMode: 'all' as ScopeMode,
   selectedProjectKey: 'ALL',
-  projectFilterTouched: false,
   selectedJobId: '',
   selectedPresetId: 'daily-coding',
   dispatchForm: {
@@ -299,49 +301,198 @@ function getProjectDisplayName(cwd: string): string {
   return parts[parts.length - 1] || unified;
 }
 
+/** 不参与多仓库自动归并的常见泛用父目录名称集合 */
+const GENERIC_PARENT_DIR_NAMES = new Set([
+  'project',
+  'projects',
+  'workspace',
+  'workspaces',
+  'idea',
+  'code',
+  'codes',
+  'repo',
+  'repos',
+  'src',
+  'work',
+  'works',
+  'dev',
+  'develop',
+  'git',
+  'github',
+  'gitlab',
+  'users',
+  'desktop',
+  'documents',
+  'downloads',
+  'home',
+  'aaa_wrok',
+  'aaa_work',
+]);
+
 /**
- * 汇总任务队列与当前工作区中的所有项目筛选选项
- * @returns 去重且标注当前项目的选项列表
+ * 判断当前是否处于对话右侧边栏（含消息能力）而非左侧全屏全局视图
+ * @returns 是否为对话右侧边栏
+ */
+function isConversationPane(): boolean {
+  return state.canSendMessage;
+}
+
+/**
+ * 将经由本面板显式打开且原无 conversationId 的任务纳入本面板绑定列表
+ * @param jobId 任务 ID
+ */
+function addBoundJobId(jobId: string): void {
+  const cleaned = String(jobId || '').trim();
+  if (!cleaned) return;
+  if (!state.boundJobIds.includes(cleaned)) {
+    state.boundJobIds = [...state.boundJobIds, cleaned];
+  }
+}
+
+/**
+ * 提取目录路径的上一级父目录（盘符根或单层路径返回空字符串）
+ * @param cwd 原始目录绝对路径
+ * @returns 父目录路径
+ */
+function getParentDirPath(cwd: string): string {
+  const unified = String(cwd || '').trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  const idx = unified.lastIndexOf('/');
+  if (idx <= 0) return '';
+  const parent = unified.slice(0, idx);
+  // 排除仅剩盘符根目录（如 "D:"）的情况
+  if (/^[a-zA-Z]:$/.test(parent)) return '';
+  return parent;
+}
+
+/**
+ * 判断父目录是否为常见泛用容器目录（避免把不相关项目误合并）
+ * @param parentPath 父目录路径
+ * @returns 是否为泛用父目录
+ */
+function isGenericParentDir(parentPath: string): boolean {
+  if (!parentPath) return true;
+  const leaf = getProjectDisplayName(parentPath).toLowerCase();
+  if (!leaf || GENERIC_PARENT_DIR_NAMES.has(leaf)) return true;
+  // 排除直接位于盘符根下的一级用户目录（如 C:/Users/xxx）
+  const parts = parentPath.split('/').filter(Boolean);
+  if (parts.length <= 2) return true;
+  return false;
+}
+
+/**
+ * 扫描任务列表，找出包含 2 个及以上不同子目录的非泛用公共父目录键集合（用于多文件夹项目自动归并）
+ * @param jobs 任务列表
+ * @returns 可自动归并的父目录归一化键集合
+ */
+function getSharedParentKeys(jobs: JobItem[]): Set<string> {
+  const parentChildrenMap = new Map<string, Set<string>>();
+  for (const job of jobs) {
+    if (job.projectName && job.projectName.trim()) continue;
+    const cwdKey = normalizeProjectKey(job.cwd);
+    if (!cwdKey) continue;
+    const parentPath = getParentDirPath(job.cwd);
+    if (!parentPath || isGenericParentDir(parentPath)) continue;
+    const parentKey = normalizeProjectKey(parentPath);
+    if (!parentKey) continue;
+    let children = parentChildrenMap.get(parentKey);
+    if (!children) {
+      children = new Set<string>();
+      parentChildrenMap.set(parentKey, children);
+    }
+    children.add(cwdKey);
+  }
+  const shared = new Set<string>();
+  for (const [parentKey, children] of parentChildrenMap.entries()) {
+    if (children.size >= 2) {
+      shared.add(parentKey);
+    }
+  }
+  return shared;
+}
+
+/**
+ * 解析单条任务在全局视图中的归属项目分组（优先显式 projectName，其次自动归并同父目录多仓库，最后按单目录）
+ * @param job 任务记录
+ * @param sharedParentKeys 公共父目录键集合
+ * @returns 分组元信息
+ */
+function resolveJobGroupMeta(
+  job: JobItem,
+  sharedParentKeys: Set<string>,
+): {
+  key: string;
+  name: string;
+  path: string;
+  subName: string;
+  projectName?: string;
+} {
+  const explicitProject = String(job.projectName || '').trim();
+  const subName = getProjectDisplayName(job.cwd);
+  if (explicitProject) {
+    return {
+      key: `proj:${explicitProject.toLowerCase()}`,
+      name: explicitProject,
+      path: job.cwd,
+      subName,
+      projectName: explicitProject,
+    };
+  }
+  const parentPath = getParentDirPath(job.cwd);
+  const parentKey = normalizeProjectKey(parentPath);
+  if (parentKey && sharedParentKeys.has(parentKey)) {
+    return {
+      key: `parent:${parentKey}`,
+      name: getProjectDisplayName(parentPath),
+      path: parentPath,
+      subName,
+    };
+  }
+  const cwdKey = normalizeProjectKey(job.cwd);
+  return {
+    key: cwdKey ? `dir:${cwdKey}` : 'dir:unknown',
+    name: subName,
+    path: job.cwd,
+    subName: '',
+  };
+}
+
+/**
+ * 汇总全局任务队列中的项目分组选项（支持多文件夹项目自动归并，不再伪造「当前项目」）
+ * @returns 去重且按任务数降序排列的项目分组列表
  */
 function getProjectOptions(): ProjectOption[] {
+  const sharedParentKeys = getSharedParentKeys(state.jobs);
   const map = new Map<string, ProjectOption>();
-  const currentKey = normalizeProjectKey(state.activeProjectCwd);
-
-  if (currentKey) {
-    map.set(currentKey, {
-      key: currentKey,
-      path: state.activeProjectCwd,
-      name: getProjectDisplayName(state.activeProjectCwd),
-      count: 0,
-      isCurrent: true,
-    });
-  }
 
   for (const job of state.jobs) {
-    const key = normalizeProjectKey(job.cwd);
-    if (!key) continue;
-    const existing = map.get(key);
+    const meta = resolveJobGroupMeta(job, sharedParentKeys);
+    const existing = map.get(meta.key);
     if (existing) {
       existing.count += 1;
+      if (meta.subName && !existing.subNames.includes(meta.subName)) {
+        existing.subNames.push(meta.subName);
+      }
+      if (job.cwd && !existing.cwds.includes(job.cwd)) {
+        existing.cwds.push(job.cwd);
+      }
     } else {
-      map.set(key, {
-        key,
-        path: job.cwd,
-        name: getProjectDisplayName(job.cwd),
+      map.set(meta.key, {
+        key: meta.key,
+        path: meta.path,
+        name: meta.name,
+        subNames: meta.subName ? [meta.subName] : [],
+        cwds: job.cwd ? [job.cwd] : [],
+        projectName: meta.projectName,
         count: 1,
-        isCurrent: key === currentKey,
       });
     }
   }
 
-  return Array.from(map.values()).sort((a, b) => {
-    if (a.isCurrent !== b.isCurrent) return a.isCurrent ? -1 : 1;
-    return b.count - a.count;
-  });
+  return Array.from(map.values()).sort((a, b) => b.count - a.count);
 }
 
 /**
- * 为尚未绑定宿主 conversationId 的侧边栏生成临时面板会话 ID，保证手动发单不与其他窗口串单
+ * 为尚未绑定宿主 conversationId 的侧边栏生成临时面板会话 ID，保证新对话打开即隔离且不与其他窗口串单
  * @returns 当前侧边栏对应的会话 ID
  */
 function ensurePaneConversationId(): string {
@@ -350,57 +501,54 @@ function ensurePaneConversationId(): string {
   const generated = `pane_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
   state.activeConversationId = generated;
   state.activeConversationTitle = '当前侧边栏会话';
-  if (!state.scopeTouched) {
-    state.scopeMode = 'conversation';
-  }
+  state.scopeMode = 'conversation';
   return generated;
 }
 
 /**
- * 绑定当前 Antigravity 对话 ID，并在用户未手动切换视角时默认切到「当前对话」隔离模式
+ * 绑定当前 Antigravity 对话 ID，并在右侧边栏中锁定为「当前对话」隔离模式
  * @param convId 对话 ID
  * @param convTitle 对话简短标题（可选）
  */
 function bindConversationScope(convId: string, convTitle = ''): void {
   const cleaned = String(convId || '').trim();
   if (!cleaned) return;
-  const changed = state.activeConversationId !== cleaned;
   state.activeConversationId = cleaned;
   if (convTitle && convTitle.trim()) {
     state.activeConversationTitle = convTitle.trim();
   }
-  if (!state.scopeTouched || changed) {
-    state.scopeMode = 'conversation';
-  }
+  state.scopeMode = 'conversation';
 }
 
 /**
- * 返回当前视角（当前对话 / 当前项目 / 全部）下的任务列表
+ * 返回当前视角下的任务列表：右侧边栏严格仅返回当前对话任务（绝不穿透泄露全局），左侧全屏按项目分组筛选
  * @returns 过滤后的任务数组
  */
 function getFilteredJobs(): JobItem[] {
-  if (state.scopeMode === 'conversation' && state.activeConversationId) {
-    return state.jobs.filter((j) => (j.conversationId || '') === state.activeConversationId);
+  if (isConversationPane() || state.scopeMode === 'conversation') {
+    return state.jobs.filter((j) => {
+      const matchConv =
+        Boolean(state.activeConversationId) && (j.conversationId || '') === state.activeConversationId;
+      const matchBound = state.boundJobIds.includes(j.id);
+      return matchConv || matchBound;
+    });
   }
-  if (state.scopeMode === 'project' && state.selectedProjectKey !== 'ALL') {
-    return state.jobs.filter((j) => normalizeProjectKey(j.cwd) === state.selectedProjectKey);
+  if (state.selectedProjectKey !== 'ALL') {
+    const sharedParentKeys = getSharedParentKeys(state.jobs);
+    return state.jobs.filter(
+      (j) => resolveJobGroupMeta(j, sharedParentKeys).key === state.selectedProjectKey,
+    );
   }
   return state.jobs;
 }
 
 /**
- * 同步当前项目默认筛选（仅在用户尚未手动切换筛选器时自动定位到当前项目）
- * @param projectCwd 服务端传入或推断的当前项目目录
+ * 记录显式传入的项目目录（仅用于发单表单默认路径，不再强行锁定左侧全局视图筛选器）
+ * @param projectCwd 服务端显式传入的项目目录
  */
 function syncDefaultProjectFilter(projectCwd: string): void {
   if (projectCwd && projectCwd.trim()) {
     state.activeProjectCwd = projectCwd.trim();
-  }
-  if (!state.projectFilterTouched && state.activeProjectCwd) {
-    const key = normalizeProjectKey(state.activeProjectCwd);
-    if (key) {
-      state.selectedProjectKey = key;
-    }
   }
 }
 
@@ -488,35 +636,20 @@ async function refreshDashboardState(forceRender = false): Promise<void> {
     if (Array.isArray(sc?.jobs)) {
       const prevIds = new Set(state.jobs.map((j) => j.id));
       state.jobs = sc.jobs;
-      // 检测到新启动的运行中任务时，严格按当前对话/项目视角决定是否自动聚焦，防止多对话并行时串台抢焦点
-      const newlyStarted = state.jobs.find((j) => j.status === 'running' && !prevIds.has(j.id));
+      // 直接在当前视角子集中检测新启动任务，避免其他对话同窗口启动的新任务遮挡本对话任务
+      const visible = getFilteredJobs();
+      const newlyStarted = visible.find((j) => j.status === 'running' && !prevIds.has(j.id));
       if (newlyStarted) {
-        const newKey = normalizeProjectKey(newlyStarted.cwd);
-        const matchesCurrentConv =
-          !state.activeConversationId ||
-          (newlyStarted.conversationId || '') === state.activeConversationId;
-        const inCurrentScope =
-          state.scopeMode === 'conversation'
-            ? matchesCurrentConv
-            : state.scopeMode === 'all' ||
-              state.selectedProjectKey === 'ALL' ||
-              state.selectedProjectKey === newKey;
-
-        if (state.scopeMode !== 'conversation' && !state.projectFilterTouched && newKey) {
-          state.activeProjectCwd = newlyStarted.cwd;
-          state.selectedProjectKey = newKey;
-        }
-        if (inCurrentScope) {
+        // 智能切单：仅当当前未选中任务或所选旧任务已结束时才自动切到新任务，避免打断正在盯盘的另一个运行中并行任务
+        const currentSelected = visible.find((j) => j.id === state.selectedJobId);
+        if (!currentSelected || currentSelected.status !== 'running') {
           state.selectedJobId = newlyStarted.id;
-          if (state.activeTab === 'dispatch' && newlyStarted.source === 'model') {
-            state.activeTab = 'monitor';
-          }
         }
-      } else {
-        const visible = getFilteredJobs();
-        if (visible.length > 0 && !visible.some((j) => j.id === state.selectedJobId)) {
-          state.selectedJobId = visible[0].id;
+        if (state.activeTab === 'dispatch' && newlyStarted.source === 'model') {
+          state.activeTab = 'monitor';
         }
+      } else if (visible.length > 0 && !visible.some((j) => j.id === state.selectedJobId)) {
+        state.selectedJobId = visible[0].id;
       }
     }
     render();
@@ -586,16 +719,20 @@ async function submitManualTask(): Promise<void> {
 
     const sc = (res as { structuredContent?: { job?: JobItem; error?: string } }).structuredContent;
     if (sc?.job) {
-      const newKey = normalizeProjectKey(sc.job.cwd);
-      if (newKey) {
-        state.activeProjectCwd = sc.job.cwd;
-        state.selectedProjectKey = newKey;
-      }
-      // 确保手动刚派发的任务立即可见，不会被之前锁定的其他视角藏住
-      if (sc.job.conversationId && state.activeConversationId === sc.job.conversationId) {
+      if (isConversationPane()) {
+        // 右侧边栏始终保持当前对话隔离，绝不回退到项目/全局视图
         state.scopeMode = 'conversation';
-      } else if (state.scopeMode === 'conversation') {
-        state.scopeMode = 'project';
+        if (!sc.job.conversationId) {
+          addBoundJobId(sc.job.id);
+        }
+      } else {
+        // 左侧全屏视图下若当前筛选分组不包含新任务，则切回全部确保立即可见
+        if (state.selectedProjectKey !== 'ALL') {
+          const groupKey = resolveJobGroupMeta(sc.job, getSharedParentKeys([...state.jobs, sc.job])).key;
+          if (groupKey !== state.selectedProjectKey) {
+            state.selectedProjectKey = 'ALL';
+          }
+        }
       }
       state.selectedJobId = sc.job.id;
       state.activeTab = 'monitor';
@@ -781,30 +918,48 @@ async function rollbackJobAction(job: JobItem, force = false): Promise<void> {
 }
 
 /**
- * 清理已完成的历史任务（按当前视角精准清理：仅本对话 / 仅本项目 / 全部）
+ * 清理已完成的历史任务（右侧边栏仅清理本对话及本面板绑定任务，左侧全局视图按所选分组或全部清理）
  */
 async function clearFinishedJobs(): Promise<void> {
   const options = getProjectOptions();
   const activeOption = options.find((o) => o.key === state.selectedProjectKey);
-  const convFilter =
-    state.scopeMode === 'conversation' && state.activeConversationId ? state.activeConversationId : '';
-  const cwdFilter =
-    state.scopeMode === 'project' && state.selectedProjectKey !== 'ALL' ? activeOption?.path || '' : '';
+  const inConvPane = isConversationPane() || state.scopeMode === 'conversation';
+  const convFilter = inConvPane ? state.activeConversationId : '';
+  const boundIds = inConvPane ? [...state.boundJobIds] : [];
+  if (inConvPane && !convFilter && boundIds.length === 0) {
+    showToast('当前对话暂无可清理的历史记录');
+    return;
+  }
+  const projectNameFilter =
+    !inConvPane && state.selectedProjectKey !== 'ALL' ? activeOption?.projectName || '' : '';
+  const cwdsFilter =
+    !inConvPane && state.selectedProjectKey !== 'ALL' && !projectNameFilter
+      ? activeOption?.cwds || []
+      : [];
   try {
     await app.callServerTool({
       name: 'app_delete_job',
       arguments: {
         job_id: 'ALL_FINISHED',
         conversation_id: convFilter || undefined,
-        cwd: cwdFilter || undefined,
+        job_ids: boundIds.length > 0 ? boundIds : undefined,
+        project_name: projectNameFilter || undefined,
+        cwds: cwdsFilter.length > 0 ? cwdsFilter : undefined,
       },
     });
+    if (inConvPane && state.boundJobIds.length > 0) {
+      // 同步剔除已结束的本地绑定任务 ID，仅保留仍在运行中的任务
+      const runningIds = new Set(
+        state.jobs.filter((j) => j.status === 'running').map((j) => j.id),
+      );
+      state.boundJobIds = state.boundJobIds.filter((id) => runningIds.has(id));
+    }
     state.selectedJobId = '';
     showToast(
-      convFilter
+      inConvPane
         ? '已清空当前对话的历史记录'
-        : cwdFilter
-          ? `已清空项目 ${getProjectDisplayName(cwdFilter)} 的历史记录`
+        : activeOption
+          ? `已清空分组 ${activeOption.name} 的历史记录`
           : '已清空全部已完成的历史记录',
     );
     await refreshDashboardState(true);
@@ -1038,68 +1193,79 @@ function renderDispatchView(): string {
 }
 
 /**
- * 渲染任务监工与验收标签页（支持按项目目录筛选、保留滚动位置、技能徽章与一键安全回滚）
+ * 渲染任务监工与验收标签页（右侧边栏严格按当前对话隔离；左侧全局视图默认展示全部并支持多文件夹项目分组筛选）
  */
 function renderMonitorView(): string {
+  const inConvPane = isConversationPane();
   const projectOptions = getProjectOptions();
+  // 先校验当前选中的分组是否仍存在，再计算 filteredJobs，避免清空分组后当次渲染闪现空列表
+  if (!inConvPane && state.selectedProjectKey !== 'ALL' && !projectOptions.some((o) => o.key === state.selectedProjectKey)) {
+    state.selectedProjectKey = 'ALL';
+  }
   const filteredJobs = getFilteredJobs();
   const activeOption = projectOptions.find((o) => o.key === state.selectedProjectKey);
-  const convJobsCount = state.activeConversationId
-    ? state.jobs.filter((j) => (j.conversationId || '') === state.activeConversationId).length
-    : 0;
-  const projectJobsCount =
-    state.selectedProjectKey === 'ALL'
-      ? state.jobs.length
-      : state.jobs.filter((j) => normalizeProjectKey(j.cwd) === state.selectedProjectKey).length;
 
-  const clearBtnLabel =
-    state.scopeMode === 'conversation' && state.activeConversationId
-      ? '清空本对话'
-      : state.scopeMode === 'project' && state.selectedProjectKey !== 'ALL'
-        ? '清空本项目'
-        : '清空全部';
+  const clearBtnLabel = inConvPane
+    ? '清空本对话'
+    : state.selectedProjectKey !== 'ALL'
+      ? '清空所选分组'
+      : '清空全部';
 
   const shortConvLabel =
     state.activeConversationTitle ||
-    (state.activeConversationId ? `对话 ${state.activeConversationId.slice(0, 8)}` : '');
+    (state.activeConversationId ? `对话 ${state.activeConversationId.slice(0, 8)}` : '当前对话');
 
-  const scopeTabsHtml = `
-    <div class="scope-tabs">
-      ${
-        state.activeConversationId
-          ? `<button type="button" class="scope-tab ${state.scopeMode === 'conversation' ? 'active' : ''}" data-scope="conversation">当前对话 (${convJobsCount})</button>`
-          : ''
-      }
-      <button type="button" class="scope-tab ${state.scopeMode === 'project' ? 'active' : ''}" data-scope="project">当前项目 (${projectJobsCount})</button>
-      <button type="button" class="scope-tab ${state.scopeMode === 'all' ? 'active' : ''}" data-scope="all">全部 (${state.jobs.length})</button>
-    </div>
-  `;
+  const formatOptionLabel = (opt: ProjectOption): string => {
+    const subHint =
+      opt.subNames.length >= 2
+        ? `（含 ${opt.subNames.slice(0, 3).join('、')}${opt.subNames.length > 3 ? ' 等' : ''}）`
+        : '';
+    return `${opt.name}${subHint}（${opt.count}）`;
+  };
 
-  const projectFilterHtml = `
-    <div class="project-filter-bar">
-      ${scopeTabsHtml}
-      ${
-        state.scopeMode === 'project'
-          ? `
-        <select id="in-project-filter" title="按项目目录筛选任务队列">
-          <option value="ALL" ${state.selectedProjectKey === 'ALL' ? 'selected' : ''}>全部项目（${state.jobs.length}）</option>
+  const projectFilterHtml = inConvPane
+    ? `
+      <div class="project-filter-bar">
+        <div class="project-path-hint" title="右侧边栏严格按当前对话隔离：${esc(state.activeConversationId || '当前面板')}">
+          仅显示当前对话：${esc(shortConvLabel)}
+        </div>
+      </div>
+    `
+    : `
+      <div class="project-filter-bar">
+        <select id="in-project-filter" title="按项目分组筛选任务队列">
+          <option value="ALL" ${state.selectedProjectKey === 'ALL' ? 'selected' : ''}>全部任务（${state.jobs.length}）</option>
           ${projectOptions
             .map(
               (opt) =>
-                `<option value="${esc(opt.key)}" ${state.selectedProjectKey === opt.key ? 'selected' : ''}>${esc(opt.name)}${opt.isCurrent ? ' [当前项目]' : ''}（${opt.count}）</option>`,
+                `<option value="${esc(opt.key)}" ${state.selectedProjectKey === opt.key ? 'selected' : ''}>${esc(formatOptionLabel(opt))}</option>`,
             )
             .join('')}
         </select>
-        <div class="project-path-hint" title="${esc(activeOption?.path || '显示全部项目的任务记录')}">
-          ${activeOption ? `当前项目：${esc(activeOption.path)}` : `共 ${projectOptions.length} 个项目 · 显示全部记录`}
+        <div class="project-path-hint" title="${esc(activeOption ? activeOption.cwds.join(' | ') : '显示所有对话与项目的全部任务记录')}">
+          ${
+            activeOption
+              ? activeOption.subNames.length >= 2
+                ? `已归并 ${activeOption.subNames.length} 个目录：${esc(activeOption.subNames.join('、'))}`
+                : `目录：${esc(activeOption.path)}`
+              : `全局视角 · 共 ${projectOptions.length} 个项目分组，${state.jobs.length} 条记录`
+          }
         </div>
-      `
-          : state.scopeMode === 'conversation' && state.activeConversationId
-            ? `<div class="project-path-hint" title="已按当前对话隔离：${esc(state.activeConversationId)}">仅显示当前对话：${esc(shortConvLabel)}</div>`
-            : `<div class="project-path-hint">显示所有对话与项目的全部任务记录（共 ${state.jobs.length} 条）</div>`
-      }
-    </div>
-  `;
+      </div>
+    `;
+
+  if (inConvPane && filteredJobs.length === 0) {
+    const isTempPane = state.activeConversationId.startsWith('pane_');
+    return `
+      <div class="card empty-state">
+        ${
+          isTempPane
+            ? '当前侧边栏为未绑定主对话的临时会话（例如刚手动重开面板），暂无任务记录。待主模型下次派单或返工调用 <code>open_codex_console</code> 时会自动绑定并同步；如需立即查看跨对话或运行中任务，请前往左侧全屏「Codex 指挥台」。'
+            : '当前对话暂无 Codex 任务记录。你可以在「指挥发单」发起任务，或在对话中让主模型派发；跨对话历史请前往左侧全屏「Codex 指挥台」查看。'
+        }
+      </div>
+    `;
+  }
 
   if (state.jobs.length === 0) {
     return `
@@ -1112,14 +1278,12 @@ function renderMonitorView(): string {
   const selected =
     filteredJobs.find((j) => j.id === state.selectedJobId) || filteredJobs[0] || null;
 
-  const emptyScopeListHint =
-    state.scopeMode === 'conversation'
-      ? '当前对话下暂无任务记录，可在上方切换至「当前项目」或「全部」。'
-      : '该项目下暂无任务记录，可在上方切换至「全部」。';
-  const emptyScopeDetailHint =
-    state.scopeMode === 'conversation'
-      ? '当前对话还没有派发过 Codex 任务。你可以直接让主模型派单，或切换上方标签查看「当前项目 / 全部」历史记录。'
-      : '当前筛选的项目下还没有任务记录。你可以切换上方项目下拉框查看其他项目，或在「指挥发单」发起新任务。';
+  const emptyScopeListHint = inConvPane
+    ? '当前对话下暂无任务记录。'
+    : '该分组下暂无任务记录，可在上方切换至「全部任务」。';
+  const emptyScopeDetailHint = inConvPane
+    ? '当前对话还没有派发过 Codex 任务。你可以直接让主模型派单，或切到左侧全屏查看跨对话历史记录。'
+    : '当前筛选的项目分组下还没有任务记录。你可以切换上方下拉框查看全部任务，或在「指挥发单」发起新任务。';
 
   const listHtml =
     filteredJobs.length > 0
@@ -1235,7 +1399,7 @@ function renderMonitorView(): string {
     <div class="monitor-layout">
       <div class="card">
         <div class="card-title">
-          <span>任务队列（${filteredJobs.length}${state.scopeMode !== 'all' && filteredJobs.length !== state.jobs.length ? `/${state.jobs.length}` : ''}）</span>
+          <span>任务队列（${filteredJobs.length}${!inConvPane && state.selectedProjectKey !== 'ALL' && filteredJobs.length !== state.jobs.length ? `/${state.jobs.length}` : ''}）</span>
           <div class="btn-row">
             <button id="btn-refresh-jobs" type="button" class="btn">刷新</button>
             <button id="btn-clear-jobs" type="button" class="btn">${clearBtnLabel}</button>
@@ -1554,7 +1718,7 @@ function render(): void {
       : state.selectedJobId;
   const sameJob = sameTab && state.lastRenderedJobId === effectiveJobId;
 
-  const runningCount = state.jobs.filter((j) => j.status === 'running').length;
+  const runningCount = getFilteredJobs().filter((j) => j.status === 'running').length;
   const contentHtml =
     state.activeTab === 'dispatch'
       ? renderDispatchView()
@@ -1693,26 +1857,11 @@ function bindEvents(): void {
   const submitBtn = document.getElementById('btn-submit-task');
   if (submitBtn) submitBtn.onclick = () => void submitManualTask();
 
-  document.querySelectorAll<HTMLButtonElement>('[data-scope]').forEach((btn) => {
-    btn.onclick = () => {
-      const next = (btn.dataset.scope as ScopeMode) || 'project';
-      state.scopeMode = next;
-      state.scopeTouched = true;
-      state.confirmRollbackJobId = '';
-      state.rollbackConflicts = [];
-      const visible = getFilteredJobs();
-      state.selectedJobId = visible[0]?.id || '';
-      render();
-    };
-  });
-
   const projectFilterEl = document.getElementById('in-project-filter') as HTMLSelectElement | null;
   if (projectFilterEl) {
     projectFilterEl.onchange = () => {
       state.selectedProjectKey = projectFilterEl.value || 'ALL';
-      state.projectFilterTouched = true;
-      state.scopeMode = 'project';
-      state.scopeTouched = true;
+      state.scopeMode = state.selectedProjectKey === 'ALL' ? 'all' : 'project';
       state.confirmRollbackJobId = '';
       state.rollbackConflicts = [];
       const visible = getFilteredJobs();
@@ -1855,6 +2004,10 @@ async function bootstrap(): Promise<void> {
     }
     if (sc?.activeConversationId) {
       bindConversationScope(sc.activeConversationId, sc.activeConversationTitle || '');
+    } else if (sc?.selectedJobId && isConversationPane()) {
+      // 主模型仅传 jobId 而漏传 conversation_id 时，将该任务绑定到当前侧边栏，避免泄露其他对话记录
+      addBoundJobId(sc.selectedJobId);
+      state.scopeMode = 'conversation';
     }
     if (sc?.config) {
       state.config = sc.config;
@@ -1864,8 +2017,14 @@ async function bootstrap(): Promise<void> {
       }
     }
     if (Array.isArray(sc?.jobs)) state.jobs = sc.jobs;
-    if (sc?.selectedJobId) state.selectedJobId = sc.selectedJobId;
+    if (sc?.selectedJobId) {
+      state.selectedJobId = sc.selectedJobId;
+      state.confirmRollbackJobId = '';
+      state.rollbackConflicts = [];
+    }
     if (sc?.focusTab) state.activeTab = sc.focusTab;
+    // 清空旧数据指纹，确保显式推送新任务后下一轮轮询不被误判为未变化
+    state.lastDashboardSignature = '';
     render();
   };
 
@@ -1879,6 +2038,21 @@ async function bootstrap(): Promise<void> {
   syncHostTheme(app.getHostContext());
   const caps = app.getHostCapabilities();
   state.canSendMessage = Boolean((caps as { message?: unknown } | undefined)?.message);
+  if (state.canSendMessage) {
+    // 对话右侧边栏默认即刻锁定当前对话隔离，空参数打开时绝不暴露其他对话历史
+    state.scopeMode = 'conversation';
+    // 若 connect 之前 ontoolresult 已带入无 conversationId 的 selectedJobId，此处补绑避免时序漏绑
+    if (!state.activeConversationId && state.selectedJobId) {
+      addBoundJobId(state.selectedJobId);
+    }
+    if (!state.activeConversationId) {
+      ensurePaneConversationId();
+    }
+  } else {
+    // 左侧全屏全局视图不属于任何项目，默认展示全部任务
+    state.scopeMode = 'all';
+    state.selectedProjectKey = 'ALL';
+  }
 
   await refreshDashboardState();
   // 首屏加载完成后后台静默向云端同步一次实时用量，不阻塞界面渲染

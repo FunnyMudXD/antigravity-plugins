@@ -157,11 +157,15 @@ const TOOLS = [
         },
         conversation_id: {
           type: 'string',
-          description: '可选：所属 Antigravity 对话 ID，用于按对话隔离任务监工视图',
+          description: '强烈建议传入：所属 Antigravity 对话 ID，用于右侧边栏严格按当前对话隔离任务',
         },
         conversation_title: {
           type: 'string',
           description: '可选：所属对话简短标题',
+        },
+        project_name: {
+          type: 'string',
+          description: '可选：所属多文件夹项目名称，用于在全局指挥台将同项目的多个子仓库目录归为同一分组',
         },
         source: {
           type: 'string',
@@ -192,6 +196,7 @@ const TOOLS = [
         timeout_sec: { type: 'number', description: '超时秒数（30-1800）' },
         conversation_id: { type: 'string', description: '可选：所属 Antigravity 对话 ID（留空时自动从原 thread_id 任务继承）' },
         conversation_title: { type: 'string', description: '可选：所属对话简短标题' },
+        project_name: { type: 'string', description: '可选：所属多文件夹项目名称（留空时自动从原任务继承）' },
         source: { type: 'string', enum: ['model', 'manual'] },
       },
     },
@@ -226,8 +231,9 @@ const TOOLS = [
           items: { type: 'string' },
           description: '可选：需要作为审查参考挂载的技能名称列表',
         },
-        conversation_id: { type: 'string', description: '可选：所属 Antigravity 对话 ID' },
+        conversation_id: { type: 'string', description: '强烈建议传入：所属 Antigravity 对话 ID' },
         conversation_title: { type: 'string', description: '可选：所属对话简短标题' },
+        project_name: { type: 'string', description: '可选：所属多文件夹项目名称' },
         source: { type: 'string', enum: ['model', 'manual'] },
       },
     },
@@ -325,7 +331,18 @@ const TOOLS = [
       properties: {
         job_id: { type: 'string', description: '任务 ID，或传 ALL_FINISHED 清空所有已结束任务' },
         cwd: { type: 'string', description: '可选：仅清空指定项目目录下的已结束任务' },
+        cwds: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '可选：仅清空指定多文件夹项目分组内多个目录的已结束任务',
+        },
+        project_name: { type: 'string', description: '可选：仅清空指定显式项目名称下的已结束任务' },
         conversation_id: { type: 'string', description: '可选：仅清空指定对话下的已结束任务' },
+        job_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '可选：仅清空指定任务 ID 集合内的已结束任务（可与 conversation_id 联合使用）',
+        },
       },
       required: ['job_id'],
     },
@@ -350,9 +367,10 @@ const TOOLS = [
 /**
  * 格式化任务摘要文本，供 Antigravity 主模型直接阅读
  * @param {object} job 任务快照
+ * @param {{ includeConsoleHint?: boolean }} [options] 附加选项（后台刚启动时追加右侧边栏同步引导）
  * @returns {string} 可读摘要
  */
-function formatJobTextSummary(job) {
+function formatJobTextSummary(job, options = {}) {
   const lines = [
     `任务 ID: ${job.id}`,
     `状态: ${job.status}（耗时 ${job.elapsedSec ?? 0} 秒）`,
@@ -379,6 +397,14 @@ function formatJobTextSummary(job) {
   if (job.lastMessage) {
     lines.push('', '--- Codex 最终回复 ---', job.lastMessage);
   }
+  // 后台异步启动时给主模型返回明确的下一步提示，防止长对话或返工阶段漏调 open_codex_console
+  if (options.includeConsoleHint && job.status === 'running') {
+    const convHint = job.conversationId || '<当前对话ID>';
+    lines.push(
+      '',
+      `下一步同步监控：请立刻调用 open_codex_console(focusTab: "monitor", jobId: "${job.id}", cwd: "${job.cwd}", conversation_id: "${convHint}") 刷新右侧边栏监控。`,
+    );
+  }
   return lines.join('\n');
 }
 
@@ -398,25 +424,18 @@ function toolResult(text, structuredContent, isError = false) {
 }
 
 /**
- * 根据调用参数、配置与任务队列按优先级推断当前项目目录
+ * 根据显式调用参数推断当前项目目录；全局空参数打开时不把历史任务目录伪造为当前项目
  * @param {{ cwd?: string, jobId?: string }} args 工具调用参数
- * @param {object} config 插件配置
  * @param {object[]} jobs 任务列表
- * @returns {string} 推断出的当前项目绝对路径（无匹配时为空字符串）
+ * @returns {string} 推断出的当前项目绝对路径（无显式上下文时为空字符串）
  */
-function inferActiveProjectCwd(args, config, jobs) {
+function inferActiveProjectCwd(args, jobs) {
   if (args?.cwd && String(args.cwd).trim()) {
     return String(args.cwd).trim();
   }
   if (args?.jobId) {
     const matched = jobs.find((j) => j.id === args.jobId);
     if (matched?.cwd) return matched.cwd;
-  }
-  if (config?.defaultCwd && String(config.defaultCwd).trim()) {
-    return String(config.defaultCwd).trim();
-  }
-  if (jobs.length > 0 && jobs[0]?.cwd) {
-    return jobs[0].cwd;
   }
   return '';
 }
@@ -445,16 +464,24 @@ async function handleToolCall(name, args = {}) {
     switch (name) {
       case 'open_codex_console': {
         const config = configStore.getConfig();
-        const jobs = jobStore.listJobs(50);
+        let jobs = jobStore.listJobs(50);
         const codexProfile = readCodexProfile();
+        const explicitConvId = String(args.conversation_id || '').trim();
+        const explicitConvTitle = String(args.conversation_title || '').trim();
+        // 若调用方已明确当前对话与目标任务，且该任务创建时漏传 conversationId，则自动补绑避免刷新后丢失归属
+        if (args.jobId && explicitConvId) {
+          const matchedBefore = jobs.find((j) => j.id === args.jobId);
+          if (matchedBefore && !String(matchedBefore.conversationId || '').trim()) {
+            jobStore.bindJobConversation(args.jobId, explicitConvId, explicitConvTitle);
+            jobs = jobStore.listJobs(50);
+          }
+        }
         const runningCount = jobs.filter((j) => j.status === 'running').length;
-        const activeProjectCwd = inferActiveProjectCwd(args, config, jobs);
-        const availableSkills = getDashboardSkills(activeProjectCwd);
+        const activeProjectCwd = inferActiveProjectCwd(args, jobs);
+        const availableSkills = getDashboardSkills(activeProjectCwd || config.defaultCwd || '');
         const targetJob = args.jobId ? jobs.find((j) => j.id === args.jobId) : null;
-        const activeConversationId =
-          String(args.conversation_id || '').trim() || targetJob?.conversationId || '';
-        const activeConversationTitle =
-          String(args.conversation_title || '').trim() || targetJob?.conversationTitle || '';
+        const activeConversationId = explicitConvId || targetJob?.conversationId || '';
+        const activeConversationTitle = explicitConvTitle || targetJob?.conversationTitle || '';
         // 当已明确当前对话时，仅按本对话子集决定默认聚焦标签与选中任务，避免被其他对话干扰
         const scopedJobs = activeConversationId
           ? jobs.filter((j) => (j.conversationId || '') === activeConversationId)
@@ -501,6 +528,7 @@ async function handleToolCall(name, args = {}) {
             cwd: targetCwd,
             conversationId: String(args.conversation_id || '').trim(),
             conversationTitle: String(args.conversation_title || '').trim(),
+            projectName: String(args.project_name || '').trim(),
             presetId: preset?.id || '',
             model: args.model !== undefined ? args.model : preset?.model || cfg.defaultModel,
             reasoningEffort: args.reasoning_effort || '',
@@ -523,7 +551,11 @@ async function handleToolCall(name, args = {}) {
           },
           jobStore,
         );
-        return toolResult(formatJobTextSummary(job), { job }, job.status === 'failed');
+        return toolResult(
+          formatJobTextSummary(job, { includeConsoleHint: Boolean(args.background) }),
+          { job },
+          job.status === 'failed',
+        );
       }
 
       case 'codex_resume': {
@@ -538,6 +570,8 @@ async function handleToolCall(name, args = {}) {
           String(args.conversation_id || '').trim() || prevJob?.conversationId || '';
         const conversationTitle =
           String(args.conversation_title || '').trim() || prevJob?.conversationTitle || '';
+        const projectName =
+          String(args.project_name || '').trim() || prevJob?.projectName || '';
         const job = await executeCodexTask(
           {
             kind: 'resume',
@@ -546,6 +580,7 @@ async function handleToolCall(name, args = {}) {
             cwd: targetCwd,
             conversationId,
             conversationTitle,
+            projectName,
             threadId: args.thread_id || '',
             useLast: Boolean(args.use_last),
             model: args.model !== undefined ? args.model : cfg.defaultModel,
@@ -556,7 +591,11 @@ async function handleToolCall(name, args = {}) {
           },
           jobStore,
         );
-        return toolResult(formatJobTextSummary(job), { job }, job.status === 'failed');
+        return toolResult(
+          formatJobTextSummary(job, { includeConsoleHint: Boolean(args.background) }),
+          { job },
+          job.status === 'failed',
+        );
       }
 
       case 'codex_review': {
@@ -579,6 +618,7 @@ async function handleToolCall(name, args = {}) {
             cwd: targetCwd,
             conversationId: String(args.conversation_id || '').trim(),
             conversationTitle: String(args.conversation_title || '').trim(),
+            projectName: String(args.project_name || '').trim(),
             presetId: preset?.id || '',
             model: args.model !== undefined ? args.model : preset?.model || cfg.defaultModel,
             reasoningEffort: args.reasoning_effort || '',
@@ -593,7 +633,11 @@ async function handleToolCall(name, args = {}) {
           },
           jobStore,
         );
-        return toolResult(formatJobTextSummary(job), { job }, job.status === 'failed');
+        return toolResult(
+          formatJobTextSummary(job, { includeConsoleHint: Boolean(args.background) }),
+          { job },
+          job.status === 'failed',
+        );
       }
 
       case 'codex_job_status': {
@@ -638,12 +682,11 @@ async function handleToolCall(name, args = {}) {
       case 'app_get_dashboard_state': {
         const config = configStore.getConfig();
         const jobs = jobStore.listJobs(50);
-        const activeProjectCwd = inferActiveProjectCwd({}, config, jobs);
         const state = {
           config,
           jobs,
-          activeProjectCwd,
-          availableSkills: getDashboardSkills(activeProjectCwd),
+          activeProjectCwd: '',
+          availableSkills: getDashboardSkills(config.defaultCwd || ''),
           codexProfile: readCodexProfile(),
           serverTime: new Date().toISOString(),
         };
@@ -658,7 +701,10 @@ async function handleToolCall(name, args = {}) {
       case 'app_delete_job': {
         const res = jobStore.deleteJob(args.job_id, {
           cwd: args.cwd || '',
+          cwds: Array.isArray(args.cwds) ? args.cwds : [],
+          projectName: args.project_name || '',
           conversationId: args.conversation_id || '',
+          jobIds: Array.isArray(args.job_ids) ? args.job_ids : [],
         });
         return toolResult(`已清理 ${res.deletedCount} 条历史任务`, {
           ...res,
